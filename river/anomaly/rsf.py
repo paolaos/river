@@ -5,7 +5,7 @@ import typing
 
 from river import base
 from river.tree.base import Branch, Leaf
-
+import math
 from .base import AnomalyDetector
 
 __all__ = ["RSForest"]
@@ -205,6 +205,7 @@ class HalfSpaceTrees(AnomalyDetector):
 
         self.trees = []
         self.counter = 0
+        self.n_instances = 0
         self._first_window = True
 
     @property
@@ -222,7 +223,7 @@ class HalfSpaceTrees(AnomalyDetector):
         return self.n_trees * self.window_size * (2 ** (self.height + 1) - 1)
 
     def learn_one(self, x):
-
+        # algo 1
         # The trees are built when the first observation comes in
         if not self.trees:
             self.trees = [
@@ -243,8 +244,10 @@ class HalfSpaceTrees(AnomalyDetector):
             for node in tree.walk(x):
                 node.l_mass += 1
 
+
         # Pivot the masses if necessary
         self.counter += 1
+        self.n_instances += 1
         if self.counter == self.window_size:
             for tree in self.trees:
                 for node in tree.iter_dfs():
@@ -263,7 +266,8 @@ class HalfSpaceTrees(AnomalyDetector):
         score = 0.0
         for tree in self.trees:
             for depth, node in enumerate(tree.walk(x)):
-                score += node.r_mass * 2**depth
+                # score += node.r_mass * 2**depth 
+                score = math.exp(math.log(abs(node.r_mass))- node.feature - math.log(self.n_instances))
                 if node.r_mass < self.size_limit:
                     break
 
