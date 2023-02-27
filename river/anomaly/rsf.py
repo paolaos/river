@@ -11,13 +11,15 @@ from .base import AnomalyDetector
 __all__ = ["RSForest"]
 
 
-class HSTBranch(Branch):
+class RSTBranch(Branch):
     def __init__(self, left, right, feature, threshold, l_mass, r_mass):
         super().__init__(left, right)
         self.feature = feature
         self.threshold = threshold
         self.l_mass = l_mass
         self.r_mass = r_mass
+        self.v = 0
+        self.acc_v = 0
 
     @property
     def left(self):
@@ -53,15 +55,15 @@ class HSTBranch(Branch):
         return f"{self.feature} < {self.threshold:.5f}"
 
 
-class HSTLeaf(Leaf):
+class RSTLeaf(Leaf):
     def __repr__(self):
         return str(self.r_mass)
 
 
-def make_padded_tree(limits, height, padding, rng=random, **node_params):
+def make_padded_tree(limits, height, v=0, acc_v = 0.0, rng=random, **node_params):
 
     if height == 0:
-        return HSTLeaf(**node_params)
+        return RSTLeaf(**node_params)
 
     # Randomly pick a feature
     # We weight each feature by the gap between each feature's limits
@@ -70,31 +72,37 @@ def make_padded_tree(limits, height, padding, rng=random, **node_params):
         weights=[limits[i][1] - limits[i][0] for i in limits],
     )[0]
 
+    #Randomly select a number r between 0 and 1
+    r = random.random_state.uniform(low=0., high=1., size=1)
+
     # Pick a split point; use padding to avoid too narrow a split
     a = limits[on][0]
     b = limits[on][1]
-    at = rng.uniform(a + padding * (b - a), b - padding * (b - a))
+
+    # Split point
+    at = rng.uniform(a + r * (b - a), (1 - r) * (b - a) + r * b)
 
     # Build the left node
     tmp = limits[on]
     limits[on] = (tmp[0], at)
+    acc_v_new = acc_v + math.log(r)
     left = make_padded_tree(
-        limits=limits, height=height - 1, padding=padding, rng=rng, **node_params
+        limits=limits, acc_v=acc_v_new, height=height - 1, v=r, rng=rng, **node_params
     )
     limits[on] = tmp
 
     # Build the right node
     tmp = limits[on]
     limits[on] = (at, tmp[1])
+    acc_v_new = acc_v + math.log(1-r)
     right = make_padded_tree(
-        limits=limits, height=height - 1, padding=padding, rng=rng, **node_params
+        limits=limits, acc_v=acc_v_new, height=height - 1, v=1-r, rng=rng, **node_params
     )
     limits[on] = tmp
+    return RSTBranch(left=left, right=right, feature=on, v=v, threshold=at, **node_params)
 
-    return HSTBranch(left=left, right=right, feature=on, threshold=at, **node_params)
 
-
-class HalfSpaceTrees(AnomalyDetector):
+class RSTrees(AnomalyDetector):
     """Half-Space Trees (HST).
 
     Half-space trees are an online variant of isolation forests. They work well when anomalies are
@@ -133,7 +141,7 @@ class HalfSpaceTrees(AnomalyDetector):
     >>> from river import anomaly
 
     >>> X = [0.5, 0.45, 0.43, 0.44, 0.445, 0.45, 0.0]
-    >>> hst = anomaly.HalfSpaceTrees(
+    >>> hst = anomaly.RSTrees(
     ...     n_trees=5,
     ...     height=3,
     ...     window_size=3,
@@ -166,7 +174,7 @@ class HalfSpaceTrees(AnomalyDetector):
 
     >>> model = compose.Pipeline(
     ...     preprocessing.MinMaxScaler(),
-    ...     anomaly.HalfSpaceTrees(seed=42)
+    ...     anomaly.RSTrees(seed=42)
     ... )
 
     >>> auc = metrics.ROCAUC()
@@ -202,11 +210,13 @@ class HalfSpaceTrees(AnomalyDetector):
             self.limits.update(limits)
         self.seed = seed
         self.rng = random.Random(seed)
-
         self.trees = []
         self.counter = 0
         self.n_instances = 0
         self._first_window = True
+        self.buffer = {}
+        self.queue = []
+        self.lr = False
 
     @property
     def size_limit(self):
@@ -230,7 +240,7 @@ class HalfSpaceTrees(AnomalyDetector):
                 make_padded_tree(
                     limits={i: self.limits[i] for i in x},
                     height=self.height,
-                    padding=0.15,
+                    v=self.v,
                     rng=self.rng,
                     # kwargs
                     r_mass=0,
@@ -248,11 +258,19 @@ class HalfSpaceTrees(AnomalyDetector):
         # Pivot the masses if necessary
         self.counter += 1
         self.n_instances += 1
-        if self.counter == self.window_size:
+        if self.counter != self.window_size:
+            self.buffer[x] = self.queue
+            # print score
+        else:
             for tree in self.trees:
+                # Update model function
+                self.lr = not self.lr
+                self.buffer = {}
                 for node in tree.iter_dfs():
-                    node.r_mass = node.l_mass
-                    node.l_mass = 0
+                    if self.lr:
+                        if node.l_mass != 0 or node.r_mass != 0:
+                            node.r_mass = 0
+                            node.l_mass = 0
             self._first_window = False
             self.counter = 0
 
@@ -267,9 +285,12 @@ class HalfSpaceTrees(AnomalyDetector):
         for tree in self.trees:
             for depth, node in enumerate(tree.walk(x)):
                 # score += node.r_mass * 2**depth 
-                score = math.exp(math.log(abs(node.r_mass))- node.feature - math.log(self.n_instances))
+                score = node.r_mass * math.exp(tree.acc_v)
+                # score = math.exp(math.log(abs(node.r_mass)) - node.feature - math.log(self.n_instances))
                 if node.r_mass < self.size_limit:
                     break
+                if depth == tree.height:
+                    self.queue.append(node)
 
         # Normalize the score between 0 and 1
         score /= self._max_score
