@@ -29,6 +29,12 @@ class RSTBranch(Branch):
     def right(self):
         return self.children[1]
 
+    def is_parent_of(self, node):
+        for child in self.children:
+            if child == node:
+                return True
+        return False
+        
     def next(self, x):
         """
 
@@ -197,7 +203,9 @@ class RSTrees(AnomalyDetector):
         self,
         n_trees=10,
         height=8,
-        window_size=250,
+        window_size=256,
+        score_threshold = 0.5,
+        node_size = 13,
         limits: typing.Dict[base.typing.FeatureName, typing.Tuple[float, float]] = None,
         seed: int = None,
     ):
@@ -208,13 +216,16 @@ class RSTrees(AnomalyDetector):
         self.limits = collections.defaultdict(functools.partial(tuple, (0, 1)))
         if limits is not None:
             self.limits.update(limits)
+        self.score_threshold = score_threshold
         self.seed = seed
         self.rng = random.Random(seed)
         self.trees = []
+        self.node_size = node_size
         self.counter = 0
         self.n_instances = 0
         self._first_window = True
         self.buffer = {}
+        self.scores = {}
         self.queue = []
         self.lr = False
 
@@ -232,8 +243,54 @@ class RSTrees(AnomalyDetector):
         """The largest potential anomaly score."""
         return self.n_trees * self.window_size * (2 ** (self.height + 1) - 1)
 
+    def _find_parent(self, tree, child):
+        for node in tree.iter_dfs():
+            if node.is_parent_of(child):
+                return node
+        return None
+
+    def _is_leaf(self, node):
+        if node.children is None or node.children == []:
+            return True
+        return False
+
+    def _update_model(self, x):
+        N = {}
+        A = {}
+        for i, (data_pt, queue) in enumerate(self.buffer.items()):
+            score = self.scores[i]
+            if score > self.score_threshold:
+                A[data_pt] = queue
+            else:
+                N[data_pt] = queue
+        for i, tree in enumerate(self.trees):
+            for data_pt, queue in A.items():
+                current_node = queue[i]
+                while current_node != None:
+                    parent = self._find_parent(tree, current_node)
+                    if parent != None:
+                        if self.lr:
+                            current_node.l_mass -= 1
+                        else:
+                            current_node.r_mass -= 1
+                    current_node = parent
+            for data_pt, queue in N.items():
+                current_node = queue[i]
+                if self.lr:
+                    n = current_node.l_mass
+                else:
+                    n = current_node.r_mass
+                if n > self.node_size and not self._is_leaf(current_node):
+                    current_node = current_node.next(x)
+                    while not self._is_leaf(current_node):
+                        if self.lr:
+                            current_node.l_mass += 1
+                        else:
+                            current_node.r_mass += 1
+                        current_node = current_node.next(x)
+        return 1
+
     def learn_one(self, x):
-        # algo 1
         # The trees are built when the first observation comes in
         if not self.trees:
             self.trees = [
@@ -263,14 +320,16 @@ class RSTrees(AnomalyDetector):
             # print score
         else:
             for tree in self.trees:
-                # Update model function
+                self._update_model(x)
                 self.lr = not self.lr
                 self.buffer = {}
+                self.scores = {}
                 for node in tree.iter_dfs():
-                    if self.lr:
-                        if node.l_mass != 0 or node.r_mass != 0:
-                            node.r_mass = 0
+                    if node.l_mass != 0 or node.r_mass != 0:
+                        if self.lr:
                             node.l_mass = 0
+                        else:
+                            node.r_mass = 0
             self._first_window = False
             self.counter = 0
 
@@ -294,6 +353,8 @@ class RSTrees(AnomalyDetector):
 
         # Normalize the score between 0 and 1
         score /= self._max_score
+
+        self.scores[x] = 1 - score
 
         # We want high score -> anomaly, but we have high score -> normal
         return 1 - score
